@@ -1,91 +1,243 @@
 /*
  * Teensy MIDI Hub
  *
- * A USB MIDI hub for Teensy 4.1
- * Detects and displays connected USB MIDI devices via the USB Host port.
+ * A USB MIDI hub for Teensy 4.1 with configurable routing.
+ * Routes MIDI between USB Host MIDI devices based on user-configured routes.
+ * Computer connection is used for Serial configuration UI only.
  */
 
 #include <USBHost_t36.h>
+#include "Config.h"
+#include "SerialInput.h"
+#include "SerialDisplay.h"
+#include "DeviceManager.h"
+#include "RouteManager.h"
+#include "Pages.h"
+#include "USBDeviceMonitor.h"
 
 // USB Host objects
 USBHost myusb;
 USBHub hub1(myusb);
 USBHub hub2(myusb);
 
-// MIDI device with BigBuffer for high-speed (480 Mbit) support
+// USB Host MIDI devices FIRST (so they get first chance to claim)
+#if MAX_MIDI_DEVICES >= 1
 MIDIDevice_BigBuffer midi1(myusb);
+#endif
+#if MAX_MIDI_DEVICES >= 2
+MIDIDevice_BigBuffer midi2(myusb);
+#endif
+#if MAX_MIDI_DEVICES >= 3
+MIDIDevice_BigBuffer midi3(myusb);
+#endif
+#if MAX_MIDI_DEVICES >= 4
+MIDIDevice_BigBuffer midi4(myusb);
+#endif
+#if MAX_MIDI_DEVICES >= 5
+MIDIDevice_BigBuffer midi5(myusb);
+#endif
+#if MAX_MIDI_DEVICES >= 6
+MIDIDevice_BigBuffer midi6(myusb);
+#endif
+#if MAX_MIDI_DEVICES >= 7
+MIDIDevice_BigBuffer midi7(myusb);
+#endif
+#if MAX_MIDI_DEVICES >= 8
+MIDIDevice_BigBuffer midi8(myusb);
+#endif
 
-// Track connection state
-bool midiConnected = false;
+// Catch-all LAST (only sees what MIDIDevices didn't claim)
+USBDeviceMonitor usbMonitor(myusb);
+
+// Array of host MIDI device pointers
+MIDIDevice_BigBuffer* midiDevices[] = {
+#if MAX_MIDI_DEVICES >= 1
+    &midi1,
+#endif
+#if MAX_MIDI_DEVICES >= 2
+    &midi2,
+#endif
+#if MAX_MIDI_DEVICES >= 3
+    &midi3,
+#endif
+#if MAX_MIDI_DEVICES >= 4
+    &midi4,
+#endif
+#if MAX_MIDI_DEVICES >= 5
+    &midi5,
+#endif
+#if MAX_MIDI_DEVICES >= 6
+    &midi6,
+#endif
+#if MAX_MIDI_DEVICES >= 7
+    &midi7,
+#endif
+#if MAX_MIDI_DEVICES >= 8
+    &midi8,
+#endif
+};
+
+// Core managers
+DeviceManager deviceManager;
+RouteManager routeManager;
+
+// UI components
+SerialInput serialInput;
+SerialDisplay serialDisplay;
+PageManager pageManager;
+
+// Pages
+MainMenuPage mainMenuPage(&pageManager, &serialDisplay, &serialInput, &deviceManager, &routeManager);
+SourceListPage sourceListPage(&pageManager, &serialDisplay, &serialInput, &deviceManager, &routeManager);
+DestListPage destListPage(&pageManager, &serialDisplay, &serialInput, &deviceManager, &routeManager);
+ConfirmRoutePage confirmRoutePage(&pageManager, &serialDisplay, &serialInput, &deviceManager, &routeManager);
+ConnectionsPage connectionsPage(&pageManager, &serialDisplay, &serialInput, &deviceManager, &routeManager);
+
+// Timing
+unsigned long lastUiUpdate = 0;
+
+// Connection change callback for MIDI devices
+void onMidiConnectionChange(int slot, bool connected) {
+    const MidiDeviceInfo* info = deviceManager.getDeviceBySlot(slot);
+    char msg[64];
+
+    if (connected && info) {
+        int count = deviceManager.getConnectedCount();
+        snprintf(msg, sizeof(msg), "%s connected! %d/%d", info->name, count, MAX_MIDI_DEVICES);
+        pageManager.showNotification(msg);
+    } else if (info && info->name[0]) {
+        snprintf(msg, sizeof(msg), "%s disconnected", info->name);
+        pageManager.showNotification(msg);
+    } else {
+        pageManager.showNotification("Device disconnected");
+    }
+}
+
+// Callback for non-MIDI devices or overflow
+void onUSBDeviceEvent(const char* message) {
+    pageManager.showNotification(message);
+}
 
 void setup() {
-  pinMode(LED_BUILTIN, OUTPUT);
+    pinMode(LED_BUILTIN, OUTPUT);
 
-  // Wait for USB to fully enumerate (helps with WSL/usbipd after upload)
-  delay(2000);
+    // Wait for USB to fully enumerate (helps with WSL/usbipd after upload)
+    delay(3000);
 
-  Serial.begin(115200);
+    Serial.begin(115200);
 
-  // Wait for serial connection with DTR
-  while (!Serial.dtr() && millis() < 5000) {
-    delay(10);
-  }
-  delay(100);  // Extra settling time
+    // Wait for serial connection with DTR (longer timeout for tio to connect)
+    while (!Serial.dtr() && millis() < 10000) {
+        delay(10);
+    }
+    delay(500);  // Extra delay after DTR for terminal to be ready
 
-  Serial.println("Teensy MIDI Hub");
-  Serial.println("===============");
+    // Initialize device manager
+    deviceManager.init(midiDevices, MAX_MIDI_DEVICES);
+    deviceManager.setConnectionCallback(onMidiConnectionChange);
 
-  // Initialize USB Host
-  myusb.begin();
+    // Set up USB monitor for non-MIDI devices and overflow
+    usbMonitor.setCallback(onUSBDeviceEvent);
 
-  Serial.println("Waiting for USB MIDI devices...");
+    // Load saved routes from EEPROM
+    routeManager.load();
+
+    // Set up page system
+    pageManager.setDisplay(&serialDisplay);
+    pageManager.setPage(PageId::MAIN_MENU, &mainMenuPage);
+    pageManager.setPage(PageId::SOURCE_LIST, &sourceListPage);
+    pageManager.setPage(PageId::DEST_LIST, &destListPage);
+    pageManager.setPage(PageId::CONFIRM_ROUTE, &confirmRoutePage);
+    pageManager.setPage(PageId::CONNECTIONS, &connectionsPage);
+
+    // Start at main menu
+    pageManager.navigateTo(PageId::MAIN_MENU);
+
+    // Initialize USB Host
+    myusb.begin();
+
+    Serial.println("Teensy MIDI Hub - Configurable Routing");
+    Serial.println("======================================");
+    Serial.print("Loaded ");
+    Serial.print(routeManager.getRouteCount());
+    Serial.println(" routes from EEPROM");
+    Serial.println();
 }
 
 void loop() {
-  // Process USB Host tasks
-  myusb.Task();
+    myusb.Task();
 
-  // Check for MIDI device connection changes
-  if (midi1 && !midiConnected) {
-    // Device just connected
-    midiConnected = true;
-    Serial.println();
-    Serial.println("MIDI Device Connected!");
+    // Update device manager (handles connect/disconnect)
+    deviceManager.update();
 
-    // Print device info
-    const uint8_t *mfg = midi1.manufacturer();
-    const uint8_t *prod = midi1.product();
-    const uint8_t *serial = midi1.serialNumber();
+    // Route MIDI between devices
+    routeMidi();
 
-    Serial.print("  Manufacturer: ");
-    Serial.println(mfg ? (const char*)mfg : "Unknown");
+    // Handle UI updates at fixed rate
+    unsigned long now = millis();
+    if (now - lastUiUpdate >= UI_REFRESH_MS) {
+        lastUiUpdate = now;
 
-    Serial.print("  Product:      ");
-    Serial.println(prod ? (const char*)prod : "Unknown");
+        // Update page logic
+        pageManager.update();
 
-    Serial.print("  Serial:       ");
-    Serial.println(serial ? (const char*)serial : "None");
+        // Check for input
+        if (serialInput.hasInput()) {
+            InputEvent event = serialInput.getInput();
+            pageManager.handleInput(event);
+        }
 
-    Serial.print("  VID:PID:      ");
-    Serial.print(midi1.idVendor(), HEX);
-    Serial.print(":");
-    Serial.println(midi1.idProduct(), HEX);
-    Serial.println();
+        // Render if needed
+        pageManager.render();
+    }
 
-  } else if (!midi1 && midiConnected) {
-    // Device just disconnected
-    midiConnected = false;
-    Serial.println("MIDI Device Disconnected");
-    Serial.println();
-  }
+    // Heartbeat LED
+    static unsigned long lastBlink = 0;
+    if (millis() - lastBlink >= 1000) {
+        lastBlink = millis();
+        digitalToggle(LED_BUILTIN);
+    }
+}
 
-  // Read any incoming MIDI (required to keep connection active)
-  midi1.read();
+void routeMidi() {
+    // Route from each connected host device
+    for (int srcSlot = 0; srcSlot < MAX_MIDI_DEVICES; srcSlot++) {
+        if (!deviceManager.isConnected(srcSlot)) continue;
 
-  // Heartbeat LED
-  static unsigned long lastBlink = 0;
-  if (millis() - lastBlink >= 1000) {
-    lastBlink = millis();
-    digitalToggle(LED_BUILTIN);
-  }
+        MIDIDevice_BigBuffer* source = deviceManager.getMidiDevice(srcSlot);
+        if (!source->read()) continue;
+
+        // Get MIDI message data
+        uint8_t type = source->getType();
+        uint8_t data1 = source->getData1();
+        uint8_t data2 = source->getData2();
+        uint8_t channel = source->getChannel();
+        uint8_t cable = source->getCable();
+
+        // Get source device info for route lookup
+        const MidiDeviceInfo* srcInfo = deviceManager.getDeviceBySlot(srcSlot);
+        if (!srcInfo) continue;
+
+        // Check each potential destination
+        for (int dstSlot = 0; dstSlot < MAX_MIDI_DEVICES; dstSlot++) {
+            if (dstSlot == srcSlot) continue;
+            if (!deviceManager.isConnected(dstSlot)) continue;
+
+            const MidiDeviceInfo* dstInfo = deviceManager.getDeviceBySlot(dstSlot);
+            if (!dstInfo) continue;
+
+            // Check if this route is configured
+            if (!routeManager.shouldRoute(srcInfo->vid, srcInfo->pid, dstInfo->vid, dstInfo->pid)) {
+                continue;
+            }
+
+            // Route the message
+            MIDIDevice_BigBuffer* dest = deviceManager.getMidiDevice(dstSlot);
+            if (type == 0xF0) {  // SystemExclusive
+                dest->sendSysEx(source->getSysExArrayLength(), source->getSysExArray(), true, cable);
+            } else {
+                dest->send(type, data1, data2, channel, cable);
+            }
+        }
+    }
 }
