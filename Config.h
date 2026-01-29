@@ -1,6 +1,10 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+// Input device selection (uncomment one)
+#define INPUT_QWIIC_TWIST
+// #define INPUT_SERIAL
+
 // Maximum MIDI devices supported
 #define MAX_MIDI_DEVICES 8
 

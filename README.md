@@ -18,6 +18,14 @@ A USB MIDI hub for Teensy 4.1 with configurable routing between USB MIDI devices
 - teensy_loader_cli
 - USB hub (for connecting multiple MIDI devices)
 
+### Optional Libraries
+
+If using Qwiic Twist input (see [Input Configuration](#input-configuration)):
+
+```bash
+arduino-cli lib install "SparkFun Qwiic Twist Arduino Library"
+```
+
 ## Building
 
 Compile the project:
@@ -49,13 +57,43 @@ tio /dev/ttyACM0
 
 Quit with `ctrl-t q`. Install tio if needed: `sudo apt install tio`
 
+### Input Configuration
+
+Input type is selected at compile time in `Config.h`:
+
+```c
+// Input device selection (uncomment one)
+#define INPUT_QWIIC_TWIST
+// #define INPUT_SERIAL
+```
+
+**Serial Input** - Use keyboard over serial terminal (default for development)
+
+**Qwiic Twist Input** - SparkFun Qwiic Twist RGB rotary encoder. Connect via I2C:
+- SDA → Pin 18
+- SCL → Pin 19
+- 3.3V → 3.3V
+- GND → GND
+
+Or use a Qwiic cable with a breakout board.
+
 ### Navigation
+
+**Serial Input:**
 
 | Key | Action |
 |-----|--------|
 | `W` / `Up Arrow` | Move up |
 | `S` / `Down Arrow` | Move down |
 | `E` / `Enter` | Select |
+
+**Qwiic Twist Input:**
+
+| Action | Result |
+|--------|--------|
+| Rotate counter-clockwise | Move up |
+| Rotate clockwise | Move down |
+| Press button | Select |
 
 ### Creating a Route
 
@@ -100,7 +138,8 @@ teensy-midi-hub/
 ├── teensy-midi-hub.ino   # Main entry point and MIDI routing
 ├── Config.h              # Configuration constants
 ├── Input.h               # Input interface
-├── SerialInput.*         # Serial input implementation
+├── SerialInput.*         # Serial/keyboard input implementation
+├── QwiicTwistInput.*     # Qwiic Twist rotary encoder input
 ├── Display.h             # Display interface
 ├── SerialDisplay.*       # Serial display implementation
 ├── Page.h                # Page base class and PageManager

@@ -8,7 +8,13 @@
 
 #include <USBHost_t36.h>
 #include "Config.h"
+#include "Input.h"
+#ifdef INPUT_QWIIC_TWIST
+#include "QwiicTwistInput.h"
+#endif
+#ifdef INPUT_SERIAL
 #include "SerialInput.h"
+#endif
 #include "SerialDisplay.h"
 #include "DeviceManager.h"
 #include "RouteManager.h"
@@ -82,16 +88,23 @@ DeviceManager deviceManager;
 RouteManager routeManager;
 
 // UI components
+#ifdef INPUT_QWIIC_TWIST
+QwiicTwistInput qwiicInput;
+Input* input = &qwiicInput;
+#endif
+#ifdef INPUT_SERIAL
 SerialInput serialInput;
+Input* input = &serialInput;
+#endif
 SerialDisplay serialDisplay;
 PageManager pageManager;
 
 // Pages
-MainMenuPage mainMenuPage(&pageManager, &serialDisplay, &serialInput, &deviceManager, &routeManager);
-SourceListPage sourceListPage(&pageManager, &serialDisplay, &serialInput, &deviceManager, &routeManager);
-DestListPage destListPage(&pageManager, &serialDisplay, &serialInput, &deviceManager, &routeManager);
-ConfirmRoutePage confirmRoutePage(&pageManager, &serialDisplay, &serialInput, &deviceManager, &routeManager);
-ConnectionsPage connectionsPage(&pageManager, &serialDisplay, &serialInput, &deviceManager, &routeManager);
+MainMenuPage mainMenuPage(&pageManager, &serialDisplay, input, &deviceManager, &routeManager);
+SourceListPage sourceListPage(&pageManager, &serialDisplay, input, &deviceManager, &routeManager);
+DestListPage destListPage(&pageManager, &serialDisplay, input, &deviceManager, &routeManager);
+ConfirmRoutePage confirmRoutePage(&pageManager, &serialDisplay, input, &deviceManager, &routeManager);
+ConnectionsPage connectionsPage(&pageManager, &serialDisplay, input, &deviceManager, &routeManager);
 
 // Timing
 unsigned long lastUiUpdate = 0;
@@ -131,6 +144,13 @@ void setup() {
         delay(10);
     }
     delay(500);  // Extra delay after DTR for terminal to be ready
+
+#ifdef INPUT_QWIIC_TWIST
+    // Initialize Qwiic Twist input
+    if (!qwiicInput.begin()) {
+        Serial.println("ERROR: Qwiic Twist not found! Check I2C connection.");
+    }
+#endif
 
     // Initialize device manager
     deviceManager.init(midiDevices, MAX_MIDI_DEVICES);
@@ -182,8 +202,8 @@ void loop() {
         pageManager.update();
 
         // Check for input
-        if (serialInput.hasInput()) {
-            InputEvent event = serialInput.getInput();
+        if (input->hasInput()) {
+            InputEvent event = input->getInput();
             pageManager.handleInput(event);
         }
 
