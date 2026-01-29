@@ -5,6 +5,10 @@
 #define INPUT_QWIIC_TWIST
 // #define INPUT_SERIAL
 
+// UI driver selection (uncomment one)
+#define UI_OLED
+// #define UI_SERIAL
+
 // Maximum MIDI devices supported
 #define MAX_MIDI_DEVICES 8
 
@@ -18,6 +22,12 @@ const int EEPROM_START_ADDR = 0;
 
 // UI refresh rate
 const unsigned long UI_REFRESH_MS = 100;
+
+// Sleep/screensaver timeout (ms) - 0 to disable
+const unsigned long SLEEP_TIMEOUT_MS = 30000;  // 30 seconds
+
+// Deep sleep timeout (ms after screensaver starts) - display turns off completely
+const unsigned long DEEP_SLEEP_TIMEOUT_MS = 600000;  // 10 minutes after screensaver
 
 // Serial input timeout for multi-byte sequences
 const unsigned long INPUT_TIMEOUT_MS = 50;
