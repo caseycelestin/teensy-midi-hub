@@ -95,7 +95,14 @@ void DeviceManager::updateDeviceName(int slot) {
         devices[slot].name[sizeof(devices[slot].name) - 1] = '\0';
     } else {
         // Fallback to VID:PID
-        snprintf(devices[slot].name, sizeof(devices[slot].name), "Device %04X:%04X",
+        snprintf(devices[slot].name, sizeof(devices[slot].name), "device %04x:%04x",
                  devices[slot].vid, devices[slot].pid);
+    }
+
+    // Convert to lowercase
+    for (char* p = devices[slot].name; *p; p++) {
+        if (*p >= 'A' && *p <= 'Z') {
+            *p = *p + ('a' - 'A');
+        }
     }
 }

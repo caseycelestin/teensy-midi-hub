@@ -15,10 +15,16 @@
 #ifdef INPUT_SERIAL
 #include "SerialInput.h"
 #endif
-#include "SerialDisplay.h"
+#include "UIDriver.h"
+#include "UIManager.h"
+#ifdef UI_OLED
+#include "OLEDUIDriver.h"
+#endif
+#ifdef UI_SERIAL
+#include "SerialUIDriver.h"
+#endif
 #include "DeviceManager.h"
 #include "RouteManager.h"
-#include "Pages.h"
 #include "USBDeviceMonitor.h"
 
 // USB Host objects
@@ -96,18 +102,91 @@ Input* input = &qwiicInput;
 SerialInput serialInput;
 Input* input = &serialInput;
 #endif
-SerialDisplay serialDisplay;
-PageManager pageManager;
+#ifdef UI_OLED
+OLEDUIDriver oledDriver;
+UIDriver* uiDriver = &oledDriver;
+#endif
+#ifdef UI_SERIAL
+SerialUIDriver serialDriver;
+UIDriver* uiDriver = &serialDriver;
+#endif
+UIManager ui;
 
-// Pages
-MainMenuPage mainMenuPage(&pageManager, &serialDisplay, input, &deviceManager, &routeManager);
-SourceListPage sourceListPage(&pageManager, &serialDisplay, input, &deviceManager, &routeManager);
-DestListPage destListPage(&pageManager, &serialDisplay, input, &deviceManager, &routeManager);
-ConfirmRoutePage confirmRoutePage(&pageManager, &serialDisplay, input, &deviceManager, &routeManager);
-ConnectionsPage connectionsPage(&pageManager, &serialDisplay, input, &deviceManager, &routeManager);
+// UI state machine
+enum class UIState {
+    MAIN_MENU,
+    SOURCE_LIST,
+    DEST_LIST
+};
+
+UIState currentState = UIState::MAIN_MENU;
+bool needsListRebuild = true;
+int mainMenuCursor = 0;  // Track cursor position for main menu
+
+// Shared state for route creation
+int selectedSourceSlot = -1;
+uint16_t selectedSourceVid = 0;
+uint16_t selectedSourcePid = 0;
+char selectedSourceName[32] = "";
+int selectedDestSlot = -1;
+uint16_t selectedDestVid = 0;
+uint16_t selectedDestPid = 0;
+char selectedDestName[32] = "";
+
+// Cached device lists (to detect changes)
+int connectedSlots[MAX_MIDI_DEVICES];
+int connectedCount = 0;
+int availableSlots[MAX_MIDI_DEVICES];
+int availableCount = 0;
 
 // Timing
 unsigned long lastUiUpdate = 0;
+
+// Forward declarations
+void buildMainMenu();
+void buildSourceList();
+void buildDestList();
+void buildConfirmRoute();
+void handleMainMenuInput(InputEvent event);
+void handleSourceListInput(InputEvent event);
+void handleDestListInput(InputEvent event);
+void handleConfirmRouteInput(InputEvent event);
+void refreshConnectedDevices();
+void refreshAvailableDevices();
+void onDeleteConfirm(bool confirmed);
+void onCreateConfirm(bool confirmed);
+void updateLedForSelection();
+
+// Check if a route has a disconnected member
+bool isRouteIncomplete(const Route* route) {
+    if (!route) return false;
+    bool srcConnected = deviceManager.findDeviceByVidPid(route->sourceVid, route->sourcePid) >= 0;
+    bool dstConnected = deviceManager.findDeviceByVidPid(route->destVid, route->destPid) >= 0;
+    return !srcConnected || !dstConnected;
+}
+
+// Update LED color based on current selection (or off if sleeping)
+void updateLedForSelection() {
+    // Turn off LED when sleeping
+    if (ui.isSleeping()) {
+        input->setColor(0, 0, 0);
+        return;
+    }
+
+    if (currentState == UIState::MAIN_MENU) {
+        ListView& list = ui.getList();
+        if (list.selectedIndex > 0) {
+            // On a route - check if incomplete
+            const Route* route = routeManager.getRoute(list.selectedIndex - 1);
+            if (isRouteIncomplete(route)) {
+                input->setColor(60, 0, 0);  // Red for incomplete
+                return;
+            }
+        }
+    }
+    // Default: dim blue
+    input->setColor(0, 0, 30);
+}
 
 // Connection change callback for MIDI devices
 void onMidiConnectionChange(int slot, bool connected) {
@@ -115,20 +194,22 @@ void onMidiConnectionChange(int slot, bool connected) {
     char msg[64];
 
     if (connected && info) {
-        int count = deviceManager.getConnectedCount();
-        snprintf(msg, sizeof(msg), "%s connected! %d/%d", info->name, count, MAX_MIDI_DEVICES);
-        pageManager.showNotification(msg);
+        snprintf(msg, sizeof(msg), "+ %s", info->name);
+        ui.showToast(msg);
     } else if (info && info->name[0]) {
-        snprintf(msg, sizeof(msg), "%s disconnected", info->name);
-        pageManager.showNotification(msg);
+        snprintf(msg, sizeof(msg), "- %s", info->name);
+        ui.showToast(msg);
     } else {
-        pageManager.showNotification("Device disconnected");
+        ui.showToast("- device");
     }
+
+    // Refresh list on device change
+    needsListRebuild = true;
 }
 
 // Callback for non-MIDI devices or overflow
 void onUSBDeviceEvent(const char* message) {
-    pageManager.showNotification(message);
+    ui.showToast(message);
 }
 
 void setup() {
@@ -152,6 +233,13 @@ void setup() {
     }
 #endif
 
+#ifdef UI_OLED
+    // Initialize OLED display
+    if (!oledDriver.begin()) {
+        Serial.println("ERROR: OLED display not found! Check I2C connection.");
+    }
+#endif
+
     // Initialize device manager
     deviceManager.init(midiDevices, MAX_MIDI_DEVICES);
     deviceManager.setConnectionCallback(onMidiConnectionChange);
@@ -162,16 +250,8 @@ void setup() {
     // Load saved routes from EEPROM
     routeManager.load();
 
-    // Set up page system
-    pageManager.setDisplay(&serialDisplay);
-    pageManager.setPage(PageId::MAIN_MENU, &mainMenuPage);
-    pageManager.setPage(PageId::SOURCE_LIST, &sourceListPage);
-    pageManager.setPage(PageId::DEST_LIST, &destListPage);
-    pageManager.setPage(PageId::CONFIRM_ROUTE, &confirmRoutePage);
-    pageManager.setPage(PageId::CONNECTIONS, &connectionsPage);
-
-    // Start at main menu
-    pageManager.navigateTo(PageId::MAIN_MENU);
+    // Set up UI
+    ui.setDriver(uiDriver);
 
     // Initialize USB Host
     myusb.begin();
@@ -198,17 +278,71 @@ void loop() {
     if (now - lastUiUpdate >= UI_REFRESH_MS) {
         lastUiUpdate = now;
 
-        // Update page logic
-        pageManager.update();
+        // Update UI (toast expiration)
+        ui.update();
+
+        // Check for device list changes in source/dest states
+        if (currentState == UIState::SOURCE_LIST) {
+            int oldCount = connectedCount;
+            refreshConnectedDevices();
+            if (connectedCount != oldCount) {
+                needsListRebuild = true;
+            }
+        } else if (currentState == UIState::DEST_LIST) {
+            int oldCount = availableCount;
+            refreshAvailableDevices();
+            if (availableCount != oldCount) {
+                needsListRebuild = true;
+            }
+        }
+
+        // Rebuild list if needed
+        if (needsListRebuild) {
+            switch (currentState) {
+                case UIState::MAIN_MENU:    buildMainMenu(); break;
+                case UIState::SOURCE_LIST:  buildSourceList(); break;
+                case UIState::DEST_LIST:    buildDestList(); break;
+            }
+            needsListRebuild = false;
+            updateLedForSelection();
+            ui.requestRedraw();
+        }
 
         // Check for input
         if (input->hasInput()) {
             InputEvent event = input->getInput();
-            pageManager.handleInput(event);
+
+            // Wake from sleep on any input
+            bool wasSleeping = ui.isSleeping();
+            ui.activity();
+
+            if (wasSleeping) {
+                // Just woke up - restore LED and skip processing this input
+                updateLedForSelection();
+            } else {
+                // Let UI manager handle confirmation dialog first
+                if (ui.handleInput(event)) {
+                    // Input was consumed by confirmation
+                } else {
+                    // Handle based on current state
+                    switch (currentState) {
+                        case UIState::MAIN_MENU:    handleMainMenuInput(event); break;
+                        case UIState::SOURCE_LIST:  handleSourceListInput(event); break;
+                        case UIState::DEST_LIST:    handleDestListInput(event); break;
+                    }
+                }
+            }
         }
 
-        // Render if needed
-        pageManager.render();
+        // Check if just entered sleep mode
+        static bool wasSleeping = false;
+        if (ui.isSleeping() != wasSleeping) {
+            wasSleeping = ui.isSleeping();
+            updateLedForSelection();  // Turn LED off/on
+        }
+
+        // Render
+        ui.render();
     }
 
     // Heartbeat LED
@@ -216,6 +350,241 @@ void loop() {
     if (millis() - lastBlink >= 1000) {
         lastBlink = millis();
         digitalToggle(LED_BUILTIN);
+    }
+}
+
+// ============================================
+// List Building Functions
+// ============================================
+
+// Static buffers for menu item text (needed because ListView stores pointers)
+static char menuBuf[MAX_LIST_ITEMS][32];
+
+void buildMainMenu() {
+    ListView& list = ui.getList();
+    list.clear();
+
+    // First item: "routes" centered with "+" on right
+    list.add(nullptr, "routes", "+");
+
+    // Existing routes (left-justified)
+    int routeCount = routeManager.getRouteCount();
+    for (int i = 0; i < routeCount && list.count < MAX_LIST_ITEMS; i++) {
+        const Route* route = routeManager.getRoute(i);
+        snprintf(menuBuf[list.count], sizeof(menuBuf[0]), "%s>%s", route->sourceName, route->destName);
+        list.add(menuBuf[list.count], nullptr, nullptr);
+    }
+
+    // Set cursor position (clamped to valid range)
+    if (mainMenuCursor >= list.count) {
+        mainMenuCursor = list.count - 1;
+    }
+    if (mainMenuCursor < 0) {
+        mainMenuCursor = 0;
+    }
+    list.selectedIndex = mainMenuCursor;
+}
+
+void buildSourceList() {
+    refreshConnectedDevices();
+
+    ListView& list = ui.getList();
+    list.clear();
+
+    // First item: back
+    list.add("<", "sources", nullptr);
+
+    // Connected devices (left-justified)
+    for (int i = 0; i < connectedCount && list.count < MAX_LIST_ITEMS; i++) {
+        const MidiDeviceInfo* info = deviceManager.getDeviceBySlot(connectedSlots[i]);
+        if (info) {
+            list.add(info->name, nullptr, nullptr);
+        }
+    }
+}
+
+void buildDestList() {
+    refreshAvailableDevices();
+
+    ListView& list = ui.getList();
+    list.clear();
+
+    // First item: back
+    list.add("<", "sinks", nullptr);
+
+    // Available destinations (left-justified)
+    for (int i = 0; i < availableCount && list.count < MAX_LIST_ITEMS; i++) {
+        const MidiDeviceInfo* info = deviceManager.getDeviceBySlot(availableSlots[i]);
+        if (info) {
+            list.add(info->name, nullptr, nullptr);
+        }
+    }
+}
+
+// ============================================
+// Input Handling Functions
+// ============================================
+
+// Track which route is being deleted
+static int deleteRouteIndex = -1;
+
+void handleMainMenuInput(InputEvent event) {
+    ListView& list = ui.getList();
+
+    switch (event) {
+        case InputEvent::UP:
+            list.selectPrev();
+            mainMenuCursor = list.selectedIndex;
+            updateLedForSelection();
+            ui.requestRedraw();
+            break;
+
+        case InputEvent::DOWN:
+            list.selectNext();
+            mainMenuCursor = list.selectedIndex;
+            updateLedForSelection();
+            ui.requestRedraw();
+            break;
+
+        case InputEvent::ENTER:
+            if (list.selectedIndex == 0) {
+                // +Route selected - go to source selection
+                currentState = UIState::SOURCE_LIST;
+                needsListRebuild = true;
+            } else {
+                // Route selected - confirm delete
+                deleteRouteIndex = list.selectedIndex - 1;
+                ui.showConfirmation("delete?", "yes", "no", onDeleteConfirm);
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+void onDeleteConfirm(bool confirmed) {
+    if (confirmed && deleteRouteIndex >= 0) {
+        routeManager.removeRouteByIndex(deleteRouteIndex);
+        ui.showToast("- route");
+    }
+    deleteRouteIndex = -1;
+    needsListRebuild = true;
+}
+
+void handleSourceListInput(InputEvent event) {
+    ListView& list = ui.getList();
+
+    switch (event) {
+        case InputEvent::UP:
+            list.selectPrev();
+            ui.requestRedraw();
+            break;
+
+        case InputEvent::DOWN:
+            list.selectNext();
+            ui.requestRedraw();
+            break;
+
+        case InputEvent::ENTER:
+            if (list.selectedIndex == 0) {
+                // Back selected
+                currentState = UIState::MAIN_MENU;
+                needsListRebuild = true;
+            } else if (list.selectedIndex - 1 < connectedCount) {
+                // Device selected
+                int slot = connectedSlots[list.selectedIndex - 1];
+                const MidiDeviceInfo* info = deviceManager.getDeviceBySlot(slot);
+                if (info) {
+                    selectedSourceSlot = slot;
+                    selectedSourceVid = info->vid;
+                    selectedSourcePid = info->pid;
+                    strncpy(selectedSourceName, info->name, sizeof(selectedSourceName) - 1);
+                    selectedSourceName[sizeof(selectedSourceName) - 1] = '\0';
+
+                    currentState = UIState::DEST_LIST;
+                    needsListRebuild = true;
+                }
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+void handleDestListInput(InputEvent event) {
+    ListView& list = ui.getList();
+
+    switch (event) {
+        case InputEvent::UP:
+            list.selectPrev();
+            ui.requestRedraw();
+            break;
+
+        case InputEvent::DOWN:
+            list.selectNext();
+            ui.requestRedraw();
+            break;
+
+        case InputEvent::ENTER:
+            if (list.selectedIndex == 0) {
+                // Back selected
+                currentState = UIState::SOURCE_LIST;
+                needsListRebuild = true;
+            } else if (list.selectedIndex - 1 < availableCount) {
+                // Device selected - create route immediately
+                int slot = availableSlots[list.selectedIndex - 1];
+                const MidiDeviceInfo* info = deviceManager.getDeviceBySlot(slot);
+                if (info) {
+                    bool added = routeManager.addRoute(
+                        selectedSourceVid, selectedSourcePid, selectedSourceName,
+                        info->vid, info->pid, info->name
+                    );
+
+                    if (added) {
+                        ui.showToast("+ route");
+                        // Set cursor to the newly created route (it's the last one)
+                        mainMenuCursor = routeManager.getRouteCount();  // +1 for header row
+                    } else if (routeManager.getRouteCount() >= MAX_ROUTES) {
+                        ui.showToast("Max routes!");
+                        mainMenuCursor = 0;
+                    } else {
+                        ui.showToast("Route exists");
+                        mainMenuCursor = 0;
+                    }
+
+                    currentState = UIState::MAIN_MENU;
+                    needsListRebuild = true;
+                }
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+// ============================================
+// Helper Functions
+// ============================================
+
+void refreshConnectedDevices() {
+    connectedCount = 0;
+    for (int i = 0; i < MAX_MIDI_DEVICES; i++) {
+        if (deviceManager.isConnected(i)) {
+            connectedSlots[connectedCount++] = i;
+        }
+    }
+}
+
+void refreshAvailableDevices() {
+    availableCount = 0;
+    for (int i = 0; i < MAX_MIDI_DEVICES; i++) {
+        // Exclude the source device
+        if (i != selectedSourceSlot && deviceManager.isConnected(i)) {
+            availableSlots[availableCount++] = i;
+        }
     }
 }
 
