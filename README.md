@@ -6,10 +6,13 @@ A USB MIDI hub for Teensy 4.1 with configurable routing between USB MIDI devices
 
 - **Configurable Routing**: Create routes between any connected MIDI devices
 - **Persistent Storage**: Routes saved to EEPROM and restored on boot
-- **Serial UI**: Text-based menu interface for configuration via terminal
+- **OLED Display**: 128x64 SSD1306 display with scrolling text and animations
+- **Serial UI**: Text-based fallback interface for configuration via terminal
 - **Hot-plug Support**: Devices can be connected/disconnected at any time
 - **Up to 8 MIDI Devices**: Support for multiple USB MIDI devices via USB hub
 - **Up to 16 Routes**: Configure complex routing setups
+- **Screensaver & Sleep**: Bouncing ball screensaver, deep sleep for OLED longevity
+- **Status LED**: Qwiic Twist LED indicates route status (red = disconnected device)
 
 ## Requirements
 
@@ -18,11 +21,19 @@ A USB MIDI hub for Teensy 4.1 with configurable routing between USB MIDI devices
 - teensy_loader_cli
 - USB hub (for connecting multiple MIDI devices)
 
-### Optional Libraries
+### Optional Hardware
 
-If using Qwiic Twist input (see [Input Configuration](#input-configuration)):
+- **OLED Display**: 128x64 SSD1306 I2C display (0x3C or 0x3D address)
+- **Qwiic Twist**: SparkFun Qwiic Twist RGB rotary encoder for input
+
+### Libraries
 
 ```bash
+# For OLED display
+arduino-cli lib install "Adafruit SSD1306"
+arduino-cli lib install "Adafruit GFX Library"
+
+# For Qwiic Twist input
 arduino-cli lib install "SparkFun Qwiic Twist Arduino Library"
 ```
 
@@ -57,25 +68,37 @@ tio /dev/ttyACM0
 
 Quit with `ctrl-t q`. Install tio if needed: `sudo apt install tio`
 
-### Input Configuration
+### Configuration
 
-Input type is selected at compile time in `Config.h`:
+Input and display types are selected at compile time in `Config.h`:
 
 ```c
 // Input device selection (uncomment one)
 #define INPUT_QWIIC_TWIST
 // #define INPUT_SERIAL
+
+// UI driver selection (uncomment one)
+#define UI_OLED
+// #define UI_SERIAL
 ```
 
-**Serial Input** - Use keyboard over serial terminal (default for development)
+**Input Options:**
+- **Serial Input** - Use keyboard over serial terminal
+- **Qwiic Twist Input** - SparkFun Qwiic Twist RGB rotary encoder
 
-**Qwiic Twist Input** - SparkFun Qwiic Twist RGB rotary encoder. Connect via I2C:
+**Display Options:**
+- **OLED** - 128x64 SSD1306 display with animations
+- **Serial** - Text-based terminal interface
+
+### I2C Wiring
+
+Both OLED and Qwiic Twist use I2C:
 - SDA → Pin 18
 - SCL → Pin 19
 - 3.3V → 3.3V
 - GND → GND
 
-Or use a Qwiic cable with a breakout board.
+Or use Qwiic cables with a breakout board for easy daisy-chaining.
 
 ### Navigation
 
@@ -97,22 +120,27 @@ Or use a Qwiic cable with a breakout board.
 
 ### Creating a Route
 
-1. From Main Menu, select **Add Route**
-2. Select the **source** device (where MIDI comes from)
-3. Select the **destination** device (where MIDI goes to)
-4. Confirm to create the route
+1. From Routes page, select **+** (add route)
+2. Select the **source** device from the sources list
+3. Select the **destination** device from the sinks list
+4. Route is created immediately
 
 ### Managing Routes
 
-1. From Main Menu, select **View Connections**
-2. Select a route to delete it
-3. Confirm deletion
+1. From Routes page, select an existing route
+2. Confirm deletion when prompted
 
 ### Notifications
 
-- Device connect/disconnect events appear at the bottom of the screen
-- Shows device name and slot count (e.g., "Launchpad Pro connected! 2/8")
-- Disconnected devices in routes show as "(off)"
+- Toast messages appear for device connect/disconnect (e.g., "+ launchpad pro")
+- Long messages scroll automatically
+- Routes with disconnected devices show red LED on Qwiic Twist
+
+### Sleep Mode
+
+- **Screensaver**: Bouncing ball after 30 seconds of inactivity
+- **Deep Sleep**: Display turns off after 10 minutes of screensaver
+- Any input wakes the display
 
 ## Hardware Setup
 
@@ -120,30 +148,36 @@ Or use a Qwiic cable with a breakout board.
                     ┌─────────────────┐
                     │   Teensy 4.1    │
                     │                 │
-   Computer ────────┤ USB Device Port │ (Serial UI only)
+   Computer ────────┤ USB Device Port │ (Serial debug only)
                     │                 │
                     │  USB Host Port  ├──── USB Hub
-                    └─────────────────┘        │
-                                               ├── MIDI Keyboard
-                                               ├── MIDI Synth
-                                               └── MIDI Controller
+                    │                 │        │
+                    │   I2C (18/19)   │        ├── MIDI Keyboard
+                    └────────┬────────┘        ├── MIDI Synth
+                             │                 └── MIDI Controller
+                    ┌────────┴────────┐
+                    │   I2C Devices   │
+                    │                 │
+                    ├── OLED Display  │ (0x3C or 0x3D)
+                    └── Qwiic Twist   │ (0x3F)
 ```
 
-The computer connection is for configuration only - MIDI is routed directly between devices on the USB Host port.
+The computer connection is for serial debug only - MIDI is routed directly between devices on the USB Host port. The OLED and Qwiic Twist can be daisy-chained via Qwiic connectors.
 
 ## Project Structure
 
 ```
 teensy-midi-hub/
-├── teensy-midi-hub.ino   # Main entry point and MIDI routing
+├── teensy-midi-hub.ino   # Main entry point, state machine, MIDI routing
 ├── Config.h              # Configuration constants
 ├── Input.h               # Input interface
 ├── SerialInput.*         # Serial/keyboard input implementation
-├── QwiicTwistInput.*     # Qwiic Twist rotary encoder input
-├── Display.h             # Display interface
-├── SerialDisplay.*       # Serial display implementation
-├── Page.h                # Page base class and PageManager
-├── Pages.*               # UI page implementations
+├── QwiicTwistInput.*     # Qwiic Twist rotary encoder input (with RGB LED)
+├── UIDriver.h            # Abstract UI driver interface
+├── UIManager.h           # Central UI controller (lists, toasts, dialogs, sleep)
+├── ListItem.h            # ListView and ListItem data structures
+├── OLEDUIDriver.h        # OLED display driver with scrolling/animations
+├── SerialUIDriver.h      # Serial terminal display driver
 ├── DeviceManager.*       # MIDI device tracking
 ├── RouteManager.*        # Route storage and EEPROM persistence
 ├── USBDeviceMonitor.*    # Overflow device detection
@@ -153,7 +187,13 @@ teensy-midi-hub/
 
 ## Architecture
 
-The UI uses abstracted Input and Display interfaces, allowing future implementations with physical buttons and OLED displays without changing the page logic.
+The UI uses a data-driven architecture:
+
+- **UIManager** - Central controller managing ListView, toast queue, confirmation dialogs, and sleep state
+- **UIDriver** - Abstract interface for display implementations (OLED, Serial)
+- **Input** - Abstract interface for input implementations (Qwiic Twist, Serial)
+
+Navigation is handled by a simple state machine in the main sketch, with UIManager handling overlays (toasts, confirmations) and sleep transitions.
 
 ## USB Type Settings
 
