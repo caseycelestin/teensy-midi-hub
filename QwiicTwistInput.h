@@ -24,6 +24,8 @@ private:
     InputEvent pendingEvent;
     int16_t lastCount;
     bool initialized;
+    unsigned long lastClickTime;
+    static const unsigned long CLICK_DEBOUNCE_MS = 200;
 };
 
 #endif
