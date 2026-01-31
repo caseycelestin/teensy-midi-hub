@@ -16,7 +16,6 @@
 #include "SerialInput.h"
 #endif
 #include "UIDriver.h"
-#include "UIManager.h"
 #ifdef UI_OLED
 #include "OLEDUIDriver.h"
 #endif
@@ -110,106 +109,117 @@ UIDriver* uiDriver = &oledDriver;
 SerialUIDriver serialDriver;
 UIDriver* uiDriver = &serialDriver;
 #endif
-UIManager ui;
-
-// UI state machine
-enum class UIState {
-    MAIN_MENU,
-    SOURCE_LIST,
-    DEST_LIST
-};
-
-UIState currentState = UIState::MAIN_MENU;
-bool needsListRebuild = true;
-int mainMenuCursor = 0;  // Track cursor position for main menu
-
-// Shared state for route creation
-int selectedSourceSlot = -1;
-uint16_t selectedSourceVid = 0;
-uint16_t selectedSourcePid = 0;
-char selectedSourceName[32] = "";
-int selectedDestSlot = -1;
-uint16_t selectedDestVid = 0;
-uint16_t selectedDestPid = 0;
-char selectedDestName[32] = "";
-
-// Cached device lists (to detect changes)
-int connectedSlots[MAX_MIDI_DEVICES];
-int connectedCount = 0;
-int availableSlots[MAX_MIDI_DEVICES];
-int availableCount = 0;
 
 // Timing
 unsigned long lastUiUpdate = 0;
+unsigned long lastActivityTime = 0;
+bool displaySleeping = false;
+
+// Page state
+enum class Page { DEVICES, DEVICE_ROUTES, DELETE_ROUTE, ADD_ROUTE };
+Page currentPage = Page::DEVICES;
+
+// UI state for list navigation
+int selectedIndex = 0;    // Currently selected item in list
+int viewStart = 0;        // First visible item (for scrolling)
+const int VISIBLE_ROWS = 3;  // Rows 1-3 on display
+
+// Connected device cache (rebuilt each frame)
+int connectedSlots[MAX_MIDI_DEVICES];
+int connectedCount = 0;
+
+// Selected device for routes page
+int selectedDeviceSlot = -1;
+uint16_t selectedDeviceVid = 0;
+uint16_t selectedDevicePid = 0;
+char selectedDeviceName[32] = "";
+
+// Routes for selected device (indices into routeManager)
+int deviceRouteIndices[MAX_ROUTES];
+bool deviceRouteActive[MAX_ROUTES];  // true if destination is connected
+int deviceRouteCount = 0;
+
+// Disconnected devices with routes (shown on devices page)
+struct DisconnectedDevice {
+    uint16_t vid;
+    uint16_t pid;
+    char name[24];
+};
+DisconnectedDevice disconnectedWithRoutes[MAX_ROUTES];
+int disconnectedCount = 0;
+
+// Route to delete
+int deleteRouteIndex = -1;
+
+// Available destinations for add route (other connected devices)
+int destSlots[MAX_MIDI_DEVICES];
+int destCount = 0;
 
 // Forward declarations
-void buildMainMenu();
-void buildSourceList();
-void buildDestList();
-void buildConfirmRoute();
-void handleMainMenuInput(InputEvent event);
-void handleSourceListInput(InputEvent event);
-void handleDestListInput(InputEvent event);
-void handleConfirmRouteInput(InputEvent event);
-void refreshConnectedDevices();
-void refreshAvailableDevices();
-void onDeleteConfirm(bool confirmed);
-void onCreateConfirm(bool confirmed);
-void updateLedForSelection();
+void routeMidi();
+void updateDeviceList();
+void updateDeviceRoutes();
+void updateAddRouteDestinations();
+void renderDevicesPage();
+void renderDeviceRoutesPage();
+void renderDeleteRoutePage();
+void renderAddRoutePage();
+void handleDevicesInput(InputEvent event);
+void handleDeviceRoutesInput(InputEvent event);
+void handleDeleteRouteInput(InputEvent event);
+void handleAddRouteInput(InputEvent event);
 
-// Check if a route has a disconnected member
-bool isRouteIncomplete(const Route* route) {
-    if (!route) return false;
-    bool srcConnected = deviceManager.findDeviceByVidPid(route->sourceVid, route->sourcePid) >= 0;
-    bool dstConnected = deviceManager.findDeviceByVidPid(route->destVid, route->destPid) >= 0;
-    return !srcConnected || !dstConnected;
-}
-
-// Update LED color based on current selection (or off if sleeping)
-void updateLedForSelection() {
-    // Turn off LED when sleeping
-    if (ui.isSleeping()) {
+// Update LED color based on current selection
+void updateLedColor() {
+    if (displaySleeping) {
         input->setColor(0, 0, 0);
         return;
     }
 
-    if (currentState == UIState::MAIN_MENU) {
-        ListView& list = ui.getList();
-        if (list.selectedIndex > 0) {
-            // On a route - check if incomplete
-            const Route* route = routeManager.getRoute(list.selectedIndex - 1);
-            if (isRouteIncomplete(route)) {
-                input->setColor(60, 0, 0);  // Red for incomplete
-                return;
-            }
-        }
+    bool onDisconnected = false;
+    if (currentPage == Page::DEVICES) {
+        onDisconnected = selectedIndex >= connectedCount && (connectedCount + disconnectedCount) > 0;
+    } else if (currentPage == Page::DEVICE_ROUTES) {
+        onDisconnected = selectedIndex < deviceRouteCount && !deviceRouteActive[selectedIndex];
     }
-    // Default: dim blue
-    input->setColor(0, 0, 30);
+
+    if (onDisconnected) {
+        input->setColor(60, 0, 0);
+    } else {
+        input->setColor(0, 0, 30);
+    }
+}
+
+// Center-locked scrolling: keeps cursor in middle row when possible
+void updateViewForSelection(int totalItems) {
+    const int centerRow = VISIBLE_ROWS / 2;  // Row 1 for 3 rows
+
+    // Calculate ideal viewStart to center the selection
+    viewStart = selectedIndex - centerRow;
+
+    // Clamp to valid range
+    if (viewStart < 0) {
+        viewStart = 0;
+    }
+    if (viewStart > totalItems - VISIBLE_ROWS) {
+        viewStart = totalItems - VISIBLE_ROWS;
+    }
+    if (viewStart < 0) {
+        viewStart = 0;  // In case totalItems < VISIBLE_ROWS
+    }
 }
 
 // Connection change callback for MIDI devices
 void onMidiConnectionChange(int slot, bool connected) {
-    const MidiDeviceInfo* info = deviceManager.getDeviceBySlot(slot);
-    char msg[64];
-
-    if (connected && info) {
-        snprintf(msg, sizeof(msg), "+ %s", info->name);
-        ui.showToast(msg);
-    } else if (info && info->name[0]) {
-        snprintf(msg, sizeof(msg), "- %s", info->name);
-        ui.showToast(msg);
-    } else {
-        ui.showToast("- device");
-    }
-
-    // Refresh list on device change
-    needsListRebuild = true;
+    (void)slot;
+    (void)connected;
+    // Connection handled by UI refresh
 }
 
 // Callback for non-MIDI devices or overflow
 void onUSBDeviceEvent(const char* message) {
-    ui.showToast(message);
+    (void)message;
+    // Non-MIDI devices ignored
 }
 
 void setup() {
@@ -218,26 +228,23 @@ void setup() {
     // Wait for USB to fully enumerate (helps with WSL/usbipd after upload)
     delay(3000);
 
+#ifndef UI_OLED
     Serial.begin(115200);
-
-    // Wait for serial connection with DTR (longer timeout for tio to connect)
+    // Wait for serial connection with DTR (only needed for serial UI)
     while (!Serial.dtr() && millis() < 10000) {
         delay(10);
     }
     delay(500);  // Extra delay after DTR for terminal to be ready
+#endif
 
 #ifdef INPUT_QWIIC_TWIST
     // Initialize Qwiic Twist input
-    if (!qwiicInput.begin()) {
-        Serial.println("ERROR: Qwiic Twist not found! Check I2C connection.");
-    }
+    qwiicInput.begin();
 #endif
 
 #ifdef UI_OLED
     // Initialize OLED display
-    if (!oledDriver.begin()) {
-        Serial.println("ERROR: OLED display not found! Check I2C connection.");
-    }
+    oledDriver.begin();
 #endif
 
     // Initialize device manager
@@ -250,18 +257,11 @@ void setup() {
     // Load saved routes from EEPROM
     routeManager.load();
 
-    // Set up UI
-    ui.setDriver(uiDriver);
-
     // Initialize USB Host
     myusb.begin();
 
-    Serial.println("Teensy MIDI Hub - Configurable Routing");
-    Serial.println("======================================");
-    Serial.print("Loaded ");
-    Serial.print(routeManager.getRouteCount());
-    Serial.println(" routes from EEPROM");
-    Serial.println();
+    // Initialize activity tracking (LED set on first frame after device list populated)
+    lastActivityTime = millis();
 }
 
 void loop() {
@@ -278,71 +278,65 @@ void loop() {
     if (now - lastUiUpdate >= UI_REFRESH_MS) {
         lastUiUpdate = now;
 
-        // Update UI (toast expiration)
-        ui.update();
-
-        // Check for device list changes in source/dest states
-        if (currentState == UIState::SOURCE_LIST) {
-            int oldCount = connectedCount;
-            refreshConnectedDevices();
-            if (connectedCount != oldCount) {
-                needsListRebuild = true;
-            }
-        } else if (currentState == UIState::DEST_LIST) {
-            int oldCount = availableCount;
-            refreshAvailableDevices();
-            if (availableCount != oldCount) {
-                needsListRebuild = true;
-            }
-        }
-
-        // Rebuild list if needed
-        if (needsListRebuild) {
-            switch (currentState) {
-                case UIState::MAIN_MENU:    buildMainMenu(); break;
-                case UIState::SOURCE_LIST:  buildSourceList(); break;
-                case UIState::DEST_LIST:    buildDestList(); break;
-            }
-            needsListRebuild = false;
-            updateLedForSelection();
-            ui.requestRedraw();
-        }
-
         // Check for input
+        bool hadInput = false;
+        InputEvent event = InputEvent::NONE;
         if (input->hasInput()) {
-            InputEvent event = input->getInput();
+            event = input->getInput();
+            hadInput = true;
+            lastActivityTime = now;
 
             // Wake from sleep on any input
-            bool wasSleeping = ui.isSleeping();
-            ui.activity();
-
-            if (wasSleeping) {
-                // Just woke up - restore LED and skip processing this input
-                updateLedForSelection();
-            } else {
-                // Let UI manager handle confirmation dialog first
-                if (ui.handleInput(event)) {
-                    // Input was consumed by confirmation
-                } else {
-                    // Handle based on current state
-                    switch (currentState) {
-                        case UIState::MAIN_MENU:    handleMainMenuInput(event); break;
-                        case UIState::SOURCE_LIST:  handleSourceListInput(event); break;
-                        case UIState::DEST_LIST:    handleDestListInput(event); break;
-                    }
-                }
+            if (displaySleeping) {
+                displaySleeping = false;
+                uiDriver->displayOn();
+                event = InputEvent::NONE;  // Consume input for wake
             }
         }
 
-        // Check if just entered sleep mode
-        static bool wasSleeping = false;
-        if (ui.isSleeping() != wasSleeping) {
-            wasSleeping = ui.isSleeping();
-            updateLedForSelection();  // Turn LED off/on
+        // Check for deep sleep timeout
+        if (!displaySleeping && DEEP_SLEEP_TIMEOUT_MS > 0) {
+            if (now - lastActivityTime >= DEEP_SLEEP_TIMEOUT_MS) {
+                displaySleeping = true;
+                uiDriver->displayOff();
+                input->setColor(0, 0, 0);
+            }
         }
 
-        // Render
-        ui.render();
+        // Skip rendering if sleeping
+        if (displaySleeping) {
+            // Still need to do the UI update check for next iteration
+        } else {
+            // Update and render based on current page
+            if (currentPage == Page::DEVICES) {
+                updateDeviceList();
+                if (hadInput && event != InputEvent::NONE) {
+                    handleDevicesInput(event);
+                }
+                updateLedColor();
+                renderDevicesPage();
+            } else if (currentPage == Page::DEVICE_ROUTES) {
+                updateDeviceRoutes();
+                if (hadInput && event != InputEvent::NONE) {
+                    handleDeviceRoutesInput(event);
+                }
+                updateLedColor();
+                renderDeviceRoutesPage();
+            } else if (currentPage == Page::DELETE_ROUTE) {
+                if (hadInput && event != InputEvent::NONE) {
+                    handleDeleteRouteInput(event);
+                }
+                updateLedColor();
+                renderDeleteRoutePage();
+            } else if (currentPage == Page::ADD_ROUTE) {
+                updateAddRouteDestinations();
+                if (hadInput && event != InputEvent::NONE) {
+                    handleAddRouteInput(event);
+                }
+                updateLedColor();
+                renderAddRoutePage();
+            }
+        }
     }
 
     // Heartbeat LED
@@ -353,239 +347,449 @@ void loop() {
     }
 }
 
-// ============================================
-// List Building Functions
-// ============================================
-
-// Static buffers for menu item text (needed because ListView stores pointers)
-static char menuBuf[MAX_LIST_ITEMS][32];
-
-void buildMainMenu() {
-    ListView& list = ui.getList();
-    list.clear();
-
-    // First item: "routes" centered with "+" on right
-    list.add(nullptr, "routes", "+");
-
-    // Existing routes (left-justified)
-    int routeCount = routeManager.getRouteCount();
-    for (int i = 0; i < routeCount && list.count < MAX_LIST_ITEMS; i++) {
+// Count routes where device is the source
+int countRoutesForDevice(uint16_t vid, uint16_t pid) {
+    int count = 0;
+    int totalRoutes = routeManager.getRouteCount();
+    for (int i = 0; i < totalRoutes; i++) {
         const Route* route = routeManager.getRoute(i);
-        snprintf(menuBuf[list.count], sizeof(menuBuf[0]), "%s>%s", route->sourceName, route->destName);
-        list.add(menuBuf[list.count], nullptr, nullptr);
-    }
-
-    // Set cursor position (clamped to valid range)
-    if (mainMenuCursor >= list.count) {
-        mainMenuCursor = list.count - 1;
-    }
-    if (mainMenuCursor < 0) {
-        mainMenuCursor = 0;
-    }
-    list.selectedIndex = mainMenuCursor;
-}
-
-void buildSourceList() {
-    refreshConnectedDevices();
-
-    ListView& list = ui.getList();
-    list.clear();
-
-    // First item: back
-    list.add("<", "sources", nullptr);
-
-    // Connected devices (left-justified)
-    for (int i = 0; i < connectedCount && list.count < MAX_LIST_ITEMS; i++) {
-        const MidiDeviceInfo* info = deviceManager.getDeviceBySlot(connectedSlots[i]);
-        if (info) {
-            list.add(info->name, nullptr, nullptr);
+        if (route && route->sourceVid == vid && route->sourcePid == pid) {
+            count++;
         }
     }
+    return count;
 }
 
-void buildDestList() {
-    refreshAvailableDevices();
-
-    ListView& list = ui.getList();
-    list.clear();
-
-    // First item: back
-    list.add("<", "sinks", nullptr);
-
-    // Available destinations (left-justified)
-    for (int i = 0; i < availableCount && list.count < MAX_LIST_ITEMS; i++) {
-        const MidiDeviceInfo* info = deviceManager.getDeviceBySlot(availableSlots[i]);
-        if (info) {
-            list.add(info->name, nullptr, nullptr);
-        }
-    }
-}
-
-// ============================================
-// Input Handling Functions
-// ============================================
-
-// Track which route is being deleted
-static int deleteRouteIndex = -1;
-
-void handleMainMenuInput(InputEvent event) {
-    ListView& list = ui.getList();
-
-    switch (event) {
-        case InputEvent::UP:
-            list.selectPrev();
-            mainMenuCursor = list.selectedIndex;
-            updateLedForSelection();
-            ui.requestRedraw();
-            break;
-
-        case InputEvent::DOWN:
-            list.selectNext();
-            mainMenuCursor = list.selectedIndex;
-            updateLedForSelection();
-            ui.requestRedraw();
-            break;
-
-        case InputEvent::ENTER:
-            if (list.selectedIndex == 0) {
-                // +Route selected - go to source selection
-                currentState = UIState::SOURCE_LIST;
-                needsListRebuild = true;
-            } else {
-                // Route selected - confirm delete
-                deleteRouteIndex = list.selectedIndex - 1;
-                ui.showConfirmation("delete?", "yes", "no", onDeleteConfirm);
-            }
-            break;
-
-        default:
-            break;
-    }
-}
-
-void onDeleteConfirm(bool confirmed) {
-    if (confirmed && deleteRouteIndex >= 0) {
-        routeManager.removeRouteByIndex(deleteRouteIndex);
-        ui.showToast("- route");
-    }
-    deleteRouteIndex = -1;
-    needsListRebuild = true;
-}
-
-void handleSourceListInput(InputEvent event) {
-    ListView& list = ui.getList();
-
-    switch (event) {
-        case InputEvent::UP:
-            list.selectPrev();
-            ui.requestRedraw();
-            break;
-
-        case InputEvent::DOWN:
-            list.selectNext();
-            ui.requestRedraw();
-            break;
-
-        case InputEvent::ENTER:
-            if (list.selectedIndex == 0) {
-                // Back selected
-                currentState = UIState::MAIN_MENU;
-                needsListRebuild = true;
-            } else if (list.selectedIndex - 1 < connectedCount) {
-                // Device selected
-                int slot = connectedSlots[list.selectedIndex - 1];
-                const MidiDeviceInfo* info = deviceManager.getDeviceBySlot(slot);
-                if (info) {
-                    selectedSourceSlot = slot;
-                    selectedSourceVid = info->vid;
-                    selectedSourcePid = info->pid;
-                    strncpy(selectedSourceName, info->name, sizeof(selectedSourceName) - 1);
-                    selectedSourceName[sizeof(selectedSourceName) - 1] = '\0';
-
-                    currentState = UIState::DEST_LIST;
-                    needsListRebuild = true;
-                }
-            }
-            break;
-
-        default:
-            break;
-    }
-}
-
-void handleDestListInput(InputEvent event) {
-    ListView& list = ui.getList();
-
-    switch (event) {
-        case InputEvent::UP:
-            list.selectPrev();
-            ui.requestRedraw();
-            break;
-
-        case InputEvent::DOWN:
-            list.selectNext();
-            ui.requestRedraw();
-            break;
-
-        case InputEvent::ENTER:
-            if (list.selectedIndex == 0) {
-                // Back selected
-                currentState = UIState::SOURCE_LIST;
-                needsListRebuild = true;
-            } else if (list.selectedIndex - 1 < availableCount) {
-                // Device selected - create route immediately
-                int slot = availableSlots[list.selectedIndex - 1];
-                const MidiDeviceInfo* info = deviceManager.getDeviceBySlot(slot);
-                if (info) {
-                    bool added = routeManager.addRoute(
-                        selectedSourceVid, selectedSourcePid, selectedSourceName,
-                        info->vid, info->pid, info->name
-                    );
-
-                    if (added) {
-                        ui.showToast("+ route");
-                        // Set cursor to the newly created route (it's the last one)
-                        mainMenuCursor = routeManager.getRouteCount();  // +1 for header row
-                    } else if (routeManager.getRouteCount() >= MAX_ROUTES) {
-                        ui.showToast("Max routes!");
-                        mainMenuCursor = 0;
-                    } else {
-                        ui.showToast("Route exists");
-                        mainMenuCursor = 0;
-                    }
-
-                    currentState = UIState::MAIN_MENU;
-                    needsListRebuild = true;
-                }
-            }
-            break;
-
-        default:
-            break;
-    }
-}
-
-// ============================================
-// Helper Functions
-// ============================================
-
-void refreshConnectedDevices() {
+void updateDeviceList() {
     connectedCount = 0;
+
     for (int i = 0; i < MAX_MIDI_DEVICES; i++) {
         if (deviceManager.isConnected(i)) {
             connectedSlots[connectedCount++] = i;
         }
     }
-}
 
-void refreshAvailableDevices() {
-    availableCount = 0;
-    for (int i = 0; i < MAX_MIDI_DEVICES; i++) {
-        // Exclude the source device
-        if (i != selectedSourceSlot && deviceManager.isConnected(i)) {
-            availableSlots[availableCount++] = i;
+    // Sort connected devices by route count (descending)
+    for (int i = 0; i < connectedCount - 1; i++) {
+        for (int j = i + 1; j < connectedCount; j++) {
+            const MidiDeviceInfo* infoI = deviceManager.getDeviceBySlot(connectedSlots[i]);
+            const MidiDeviceInfo* infoJ = deviceManager.getDeviceBySlot(connectedSlots[j]);
+            int countI = infoI ? countRoutesForDevice(infoI->vid, infoI->pid) : 0;
+            int countJ = infoJ ? countRoutesForDevice(infoJ->vid, infoJ->pid) : 0;
+            if (countJ > countI) {
+                int tmp = connectedSlots[i];
+                connectedSlots[i] = connectedSlots[j];
+                connectedSlots[j] = tmp;
+            }
         }
     }
+
+    // Find disconnected devices that have routes
+    disconnectedCount = 0;
+    int totalRoutes = routeManager.getRouteCount();
+    for (int i = 0; i < totalRoutes; i++) {
+        const Route* route = routeManager.getRoute(i);
+        if (!route) continue;
+
+        // Check if source is disconnected
+        if (deviceManager.findDeviceByVidPid(route->sourceVid, route->sourcePid) < 0) {
+            // Check if we already added this device
+            bool found = false;
+            for (int j = 0; j < disconnectedCount; j++) {
+                if (disconnectedWithRoutes[j].vid == route->sourceVid &&
+                    disconnectedWithRoutes[j].pid == route->sourcePid) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && disconnectedCount < MAX_ROUTES) {
+                disconnectedWithRoutes[disconnectedCount].vid = route->sourceVid;
+                disconnectedWithRoutes[disconnectedCount].pid = route->sourcePid;
+                snprintf(disconnectedWithRoutes[disconnectedCount].name,
+                         sizeof(disconnectedWithRoutes[disconnectedCount].name),
+                         "%s", route->sourceName);
+                disconnectedCount++;
+            }
+        }
+    }
+
+    // Sort disconnected devices by route count (descending)
+    for (int i = 0; i < disconnectedCount - 1; i++) {
+        for (int j = i + 1; j < disconnectedCount; j++) {
+            int countI = countRoutesForDevice(disconnectedWithRoutes[i].vid, disconnectedWithRoutes[i].pid);
+            int countJ = countRoutesForDevice(disconnectedWithRoutes[j].vid, disconnectedWithRoutes[j].pid);
+            if (countJ > countI) {
+                DisconnectedDevice tmp = disconnectedWithRoutes[i];
+                disconnectedWithRoutes[i] = disconnectedWithRoutes[j];
+                disconnectedWithRoutes[j] = tmp;
+            }
+        }
+    }
+
+    // Total items = connected + disconnected
+    int totalItems = connectedCount + disconnectedCount;
+
+    // Clamp selection and update view
+    if (totalItems > 0) {
+        if (selectedIndex >= totalItems) {
+            selectedIndex = totalItems - 1;
+        }
+        if (selectedIndex < 0) {
+            selectedIndex = 0;
+        }
+        updateViewForSelection(totalItems);
+    } else {
+        selectedIndex = 0;
+        viewStart = 0;
+    }
+}
+
+void updateDeviceRoutes() {
+    // Find all routes where selected device is the source
+    // First pass: collect active routes
+    deviceRouteCount = 0;
+    int totalRoutes = routeManager.getRouteCount();
+
+    for (int i = 0; i < totalRoutes; i++) {
+        const Route* route = routeManager.getRoute(i);
+        if (route && route->sourceVid == selectedDeviceVid && route->sourcePid == selectedDevicePid) {
+            bool active = (deviceManager.findDeviceByVidPid(route->destVid, route->destPid) >= 0);
+            if (active) {
+                deviceRouteIndices[deviceRouteCount] = i;
+                deviceRouteActive[deviceRouteCount] = true;
+                deviceRouteCount++;
+            }
+        }
+    }
+
+    // Second pass: collect inactive routes
+    for (int i = 0; i < totalRoutes; i++) {
+        const Route* route = routeManager.getRoute(i);
+        if (route && route->sourceVid == selectedDeviceVid && route->sourcePid == selectedDevicePid) {
+            bool active = (deviceManager.findDeviceByVidPid(route->destVid, route->destPid) >= 0);
+            if (!active) {
+                deviceRouteIndices[deviceRouteCount] = i;
+                deviceRouteActive[deviceRouteCount] = false;
+                deviceRouteCount++;
+            }
+        }
+    }
+
+    // Total items: routes + "+ add route" + "< back"
+    int totalItems = deviceRouteCount + 2;
+
+    // Clamp selection and update view
+    if (selectedIndex >= totalItems) {
+        selectedIndex = totalItems - 1;
+    }
+    if (selectedIndex < 0) {
+        selectedIndex = 0;
+    }
+    updateViewForSelection(totalItems);
+}
+
+void handleDevicesInput(InputEvent event) {
+    int totalItems = connectedCount + disconnectedCount;
+
+    switch (event) {
+        case InputEvent::UP:
+            if (selectedIndex > 0) {
+                selectedIndex--;
+                updateViewForSelection(totalItems);
+            }
+            break;
+        case InputEvent::DOWN:
+            if (selectedIndex < totalItems - 1) {
+                selectedIndex++;
+                updateViewForSelection(totalItems);
+            }
+            break;
+        case InputEvent::ENTER:
+            if (selectedIndex < connectedCount) {
+                // Connected device selected
+                int slot = connectedSlots[selectedIndex];
+                const MidiDeviceInfo* info = deviceManager.getDeviceBySlot(slot);
+                if (info) {
+                    selectedDeviceSlot = slot;
+                    selectedDeviceVid = info->vid;
+                    selectedDevicePid = info->pid;
+                    snprintf(selectedDeviceName, sizeof(selectedDeviceName), "%s", info->name);
+
+                    currentPage = Page::DEVICE_ROUTES;
+                    selectedIndex = 0;
+                    viewStart = 0;
+                }
+            } else if (selectedIndex < totalItems) {
+                // Disconnected device selected
+                int idx = selectedIndex - connectedCount;
+                selectedDeviceSlot = -1;  // Not connected
+                selectedDeviceVid = disconnectedWithRoutes[idx].vid;
+                selectedDevicePid = disconnectedWithRoutes[idx].pid;
+                snprintf(selectedDeviceName, sizeof(selectedDeviceName), "%s", disconnectedWithRoutes[idx].name);
+
+                currentPage = Page::DEVICE_ROUTES;
+                selectedIndex = 0;
+                viewStart = 0;
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void handleDeviceRoutesInput(InputEvent event) {
+    // Order: routes, + add route, < back
+    int totalItems = deviceRouteCount + 2;  // routes + "+ add route" + "< back"
+
+    switch (event) {
+        case InputEvent::UP:
+            if (selectedIndex > 0) {
+                selectedIndex--;
+                updateViewForSelection(totalItems);
+            }
+            break;
+        case InputEvent::DOWN:
+            if (selectedIndex < totalItems - 1) {
+                selectedIndex++;
+                updateViewForSelection(totalItems);
+            }
+            break;
+        case InputEvent::ENTER:
+            if (selectedIndex < deviceRouteCount) {
+                // Route selected - go to delete confirmation
+                deleteRouteIndex = deviceRouteIndices[selectedIndex];
+                currentPage = Page::DELETE_ROUTE;
+                selectedIndex = 0;  // Default to "no"
+                viewStart = 0;
+            } else if (selectedIndex == deviceRouteCount) {
+                // "+ add route" - go to destination selection
+                currentPage = Page::ADD_ROUTE;
+                selectedIndex = 0;
+                viewStart = 0;
+            } else {
+                // "< back" - return to devices page
+                currentPage = Page::DEVICES;
+                selectedIndex = 0;
+                viewStart = 0;
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void renderDevicesPage() {
+    uiDriver->beginFrame();
+    uiDriver->drawHeader("devices");
+
+    int totalItems = connectedCount + disconnectedCount;
+    static char nameBuf[32];
+
+    for (int row = 0; row < VISIBLE_ROWS; row++) {
+        int itemIndex = viewStart + row;
+        if (itemIndex >= totalItems) break;
+
+        bool selected = (itemIndex == selectedIndex);
+
+        if (itemIndex < connectedCount) {
+            // Connected device
+            int slot = connectedSlots[itemIndex];
+            const MidiDeviceInfo* info = deviceManager.getDeviceBySlot(slot);
+            if (info) {
+                uiDriver->drawListItem(info->name, selected, row);
+            }
+        } else {
+            // Disconnected device with routes - show with ~ prefix
+            int idx = itemIndex - connectedCount;
+            snprintf(nameBuf, sizeof(nameBuf), "~%s", disconnectedWithRoutes[idx].name);
+            uiDriver->drawListItem(nameBuf, selected, row);
+        }
+    }
+
+    // Scroll indicators
+    bool canScrollUp = (viewStart > 0);
+    bool canScrollDown = (viewStart + VISIBLE_ROWS < totalItems);
+    uiDriver->drawScrollIndicators(canScrollUp, canScrollDown);
+
+    uiDriver->endFrame();
+}
+
+void renderDeviceRoutesPage() {
+    uiDriver->beginFrame();
+    uiDriver->drawHeader(selectedDeviceName);
+
+    // Order: routes, + add route, < back
+    int totalItems = deviceRouteCount + 2;  // routes + "+ add route" + "< back"
+    static char nameBuf[32];
+
+    for (int row = 0; row < VISIBLE_ROWS; row++) {
+        int itemIndex = viewStart + row;
+        if (itemIndex >= totalItems) break;
+
+        bool selected = (itemIndex == selectedIndex);
+
+        if (itemIndex < deviceRouteCount) {
+            // Route item - show destination name (with ~ if inactive)
+            int routeIdx = deviceRouteIndices[itemIndex];
+            const Route* route = routeManager.getRoute(routeIdx);
+            if (route) {
+                if (deviceRouteActive[itemIndex]) {
+                    uiDriver->drawListItem(route->destName, selected, row);
+                } else {
+                    snprintf(nameBuf, sizeof(nameBuf), "~%s", route->destName);
+                    uiDriver->drawListItem(nameBuf, selected, row);
+                }
+            }
+        } else if (itemIndex == deviceRouteCount) {
+            uiDriver->drawListItem("+ add route", selected, row);
+        } else {
+            uiDriver->drawListItem("< back", selected, row);
+        }
+    }
+
+    // Scroll indicators
+    bool canScrollUp = (viewStart > 0);
+    bool canScrollDown = (viewStart + VISIBLE_ROWS < totalItems);
+    uiDriver->drawScrollIndicators(canScrollUp, canScrollDown);
+
+    uiDriver->endFrame();
+}
+
+void handleDeleteRouteInput(InputEvent event) {
+    switch (event) {
+        case InputEvent::UP:
+            if (selectedIndex > 0) selectedIndex--;
+            break;
+        case InputEvent::DOWN:
+            if (selectedIndex < 1) selectedIndex++;
+            break;
+        case InputEvent::ENTER:
+            if (selectedIndex == 1) {
+                // "yes" - delete the route
+                routeManager.removeRouteByIndex(deleteRouteIndex);
+            }
+            // Both options return to device routes page
+            currentPage = Page::DEVICE_ROUTES;
+            selectedIndex = 0;
+            viewStart = 0;
+            // LED updated after updateDeviceRoutes() runs
+            break;
+        default:
+            break;
+    }
+}
+
+void renderDeleteRoutePage() {
+    uiDriver->beginFrame();
+    uiDriver->drawHeader("delete");
+    uiDriver->drawListItem("no", selectedIndex == 0, 0);
+    uiDriver->drawListItem("yes", selectedIndex == 1, 1);
+    uiDriver->endFrame();
+}
+
+void updateAddRouteDestinations() {
+    // Find all connected devices except the selected source that don't already have a route
+    destCount = 0;
+    for (int i = 0; i < MAX_MIDI_DEVICES; i++) {
+        if (i != selectedDeviceSlot && deviceManager.isConnected(i)) {
+            const MidiDeviceInfo* destInfo = deviceManager.getDeviceBySlot(i);
+            if (destInfo) {
+                // Skip if route already exists
+                if (routeManager.shouldRoute(selectedDeviceVid, selectedDevicePid,
+                                              destInfo->vid, destInfo->pid)) {
+                    continue;
+                }
+                destSlots[destCount++] = i;
+            }
+        }
+    }
+
+    // Total items: destinations + "< back"
+    int totalItems = destCount + 1;
+
+    // Clamp selection and update view
+    if (selectedIndex >= totalItems) {
+        selectedIndex = totalItems - 1;
+    }
+    if (selectedIndex < 0) {
+        selectedIndex = 0;
+    }
+    updateViewForSelection(totalItems);
+}
+
+void handleAddRouteInput(InputEvent event) {
+    int totalItems = destCount + 1;  // destinations + "< back"
+
+    switch (event) {
+        case InputEvent::UP:
+            if (selectedIndex > 0) {
+                selectedIndex--;
+                updateViewForSelection(totalItems);
+            }
+            break;
+        case InputEvent::DOWN:
+            if (selectedIndex < totalItems - 1) {
+                selectedIndex++;
+                updateViewForSelection(totalItems);
+            }
+            break;
+        case InputEvent::ENTER:
+            if (selectedIndex == totalItems - 1) {
+                // "< back" - return to device routes
+                currentPage = Page::DEVICE_ROUTES;
+                selectedIndex = 0;
+                viewStart = 0;
+                // LED updated after updateDeviceRoutes() runs
+            } else if (selectedIndex < destCount) {
+                // Destination selected - create route
+                int destSlot = destSlots[selectedIndex];
+                const MidiDeviceInfo* destInfo = deviceManager.getDeviceBySlot(destSlot);
+                if (destInfo) {
+                    routeManager.addRoute(
+                        selectedDeviceVid, selectedDevicePid, selectedDeviceName,
+                        destInfo->vid, destInfo->pid, destInfo->name
+                    );
+                }
+                currentPage = Page::DEVICE_ROUTES;
+                selectedIndex = 0;
+                viewStart = 0;
+                // LED updated after updateDeviceRoutes() runs
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void renderAddRoutePage() {
+    uiDriver->beginFrame();
+    uiDriver->drawHeader("add route");
+
+    int totalItems = destCount + 1;  // destinations + "< back"
+
+    for (int row = 0; row < VISIBLE_ROWS; row++) {
+        int itemIndex = viewStart + row;
+        if (itemIndex >= totalItems) break;
+
+        bool selected = (itemIndex == selectedIndex);
+
+        if (itemIndex == totalItems - 1) {
+            uiDriver->drawListItem("< back", selected, row);
+        } else {
+            int slot = destSlots[itemIndex];
+            const MidiDeviceInfo* info = deviceManager.getDeviceBySlot(slot);
+            if (info) {
+                uiDriver->drawListItem(info->name, selected, row);
+            }
+        }
+    }
+
+    // Scroll indicators
+    bool canScrollUp = (viewStart > 0);
+    bool canScrollDown = (viewStart + VISIBLE_ROWS < totalItems);
+    uiDriver->drawScrollIndicators(canScrollUp, canScrollDown);
+
+    uiDriver->endFrame();
 }
 
 void routeMidi() {

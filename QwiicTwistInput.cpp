@@ -2,7 +2,7 @@
 #include <Wire.h>
 
 QwiicTwistInput::QwiicTwistInput()
-    : pendingEvent(InputEvent::NONE), lastCount(0), initialized(false) {
+    : pendingEvent(InputEvent::NONE), lastCount(0), initialized(false), lastClickTime(0) {
 }
 
 bool QwiicTwistInput::begin() {
@@ -28,10 +28,14 @@ bool QwiicTwistInput::hasInput() {
         return true;
     }
 
-    // Check for button click (fires once on release, not while held)
+    // Check for button click with debounce
     if (twist.isClicked()) {
-        pendingEvent = InputEvent::ENTER;
-        return true;
+        unsigned long now = millis();
+        if (now - lastClickTime >= CLICK_DEBOUNCE_MS) {
+            lastClickTime = now;
+            pendingEvent = InputEvent::ENTER;
+            return true;
+        }
     }
 
     // Check for rotation
